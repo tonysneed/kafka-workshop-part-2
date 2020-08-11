@@ -1,4 +1,5 @@
-﻿using Microsoft.Extensions.Hosting;
+﻿using EventStreamProcessing.Abstractions;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using System;
 using System.Threading;
@@ -8,10 +9,12 @@ namespace Worker
 {
     public class KafkaWorker : BackgroundService
     {
+        private readonly IEventProcessor eventProcessor;
         private readonly ILogger logger;
 
-        public KafkaWorker(ILogger logger)
+        public KafkaWorker(IEventProcessor eventProcessor, ILogger logger)
         {
+            this.eventProcessor = eventProcessor;
             this.logger = logger;
         }
 
@@ -21,7 +24,8 @@ namespace Worker
             {
                 logger.LogInformation("Worker processing event at: {time}", DateTimeOffset.Now);
 
-                // TODO: Process event
+                // Process event
+                await eventProcessor.Process(cancellationToken);
             }
         }
     }
