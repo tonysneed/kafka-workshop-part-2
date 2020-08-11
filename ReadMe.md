@@ -1,6 +1,10 @@
-# Kafka Workshop Part 2: Stream Processing
+# Kafka Workshop Part 2: Stateless Stream Processing
 
-Event Stream Processing
+In this exercise you will create a .NET Core worker service to perform stateless (single-event) stream processing. By adding a reference to the `EventStreamProcessing.Kafka` package, you will be able to register a `KafkaEventProcessor` that accepts `KafkaEventConsumer`, `KafkaEventProducer`, and an array of `MessageHandler` to validate, enrich and filter messages.
+
+When the **Producer** console app sends messages to the "raw-events" topics, the event processor will read these messages, sending them through the chain of message handlers you have configured, then write messages to the "processed-events" topic. The **Consumer** console app will read and display the processed messages.
+
+> **Note**: Here is a blog post explaining the design of  the event stream processing framework: https://blog.tonysneed.com/2020/06/25/event-stream-processing-micro-framework-apache-kafka/.
 
 ### Prerequisites
 
@@ -14,203 +18,237 @@ Event Stream Processing
 
 > **Note**: Switch to the `after` branch to view the completed solution: `git checkout after`
 
-## Producer
+## Worker Application
 
-1. Add `Confluent.Kafka` package.
-2. Add `Run_Producer` method.
-
-```csharp
-private static async Task Run_Producer(string brokerList, string topicName, CancellationToken cancellationToken)
-{
-    var config = new ProducerConfig { BootstrapServers = brokerList };
-
-    using (var producer = new ProducerBuilder<int, string>(config).Build())
+1. Add NuGet packages to the **Worker** project.
+    ```bash
+    cd Worker
+    dotnet add package Confluent.Kafka
+    dotnet add package Microsoft.Extensions.Hosting
+    dotnet add package EventStreamProcessing.Kafka
+    ```
+2. Create validation, enrichment and filter message handlers.
+   - Remove **Placeholder.txt** from the **Handlers** folder.
+   - Add a `ValidationHandler` class to the **Handlers** folder that extends `MessageHandler`.
+     - Add a **ctor** to inject `languageStore`, `validationErrorProducer`, `logger`.
+    ```csharp
+    public class ValidationHandler : MessageHandler
     {
-        Console.WriteLine("\n-----------------------------------------------------------------------");
-        Console.WriteLine($"Producer {producer.Name} producing on topic {topicName} to brokers {brokerList}.");
-        Console.WriteLine("-----------------------------------------------------------------------");
-        Console.WriteLine("To create a kafka message with integer key and string value:");
-        Console.WriteLine("> key value<Enter>");
-        Console.WriteLine("Ctrl-C then <Enter> to quit.\n");
+        private readonly IDictionary<int, string> languageStore;
+        private readonly IEventProducer<Confluent.Kafka.Message<int, string>> validationErrorProducer;
+        private readonly ILogger logger;
 
-        while (!cancellationToken.IsCancellationRequested)
+        public ValidationHandler(IDictionary<int, string> languageStore,
+            IEventProducer<Confluent.Kafka.Message<int, string>> validationErrorProducer,
+            ILogger logger)
         {
-            Console.Write("> ");
-
-            string text;
-            try
-            {
-                text = Console.ReadLine();
-            }
-            catch (IOException)
-            {
-                // IO exception is thrown when ConsoleCancelEventArgs.Cancel == true.
-                break;
-            }
-            if (text == null || text.Length == 0)
-            {
-                // Console returned null before 
-                // the CancelKeyPress was treated
-                continue;
-            }
-
-            int key = 0;
-            string val = text;
-
-            // split line if both key and value specified.
-            int index = text.IndexOf(" ");
-            if (index != -1)
-            {
-                key = int.Parse(text.Substring(0, index));
-                val = text.Substring(index + 1);
-            }
-
-            try
-            {
-                // Note: Awaiting the asynchronous produce request below prevents flow of execution
-                // from proceeding until the acknowledgement from the broker is received (at the 
-                // expense of low throughput).
-                var deliveryReport = await producer.ProduceAsync(
-                    topicName, new Message<int, string> { Key = key, Value = val });
-
-                Console.WriteLine($"delivered to: {deliveryReport.TopicPartitionOffset}");
-            }
-            catch (ProduceException<int, string> e)
-            {
-                Console.WriteLine($"failed to deliver message: {e.Message} [{e.Error.Code}]");
-            }
-        }
-
-        // Since we are producing synchronously, at this point there will be no messages
-        // in-flight and no delivery reports waiting to be acknowledged, so there is no
-        // need to call producer.Flush before disposing the producer.
-    }
-}
-```
-
-3. Call `Run_Producer` method.
-
-```csharp
-static async Task Main(string[] args)
-{
-    CancellationTokenSource cts = new CancellationTokenSource();
-    Console.CancelKeyPress += (_, e) => {
-        e.Cancel = true; // prevent the process from terminating.
-        cts.Cancel();
-    };
-
-    await Run_Producer("localhost:9092", "raw-events", cts.Token);
-}
-```
-
-## Consumer
-
-1. Add `Confluent.Kafka` package.
-2. Create `Run_Consumer` method.
-
-```csharp
-public static void Run_Consumer(string brokerList, List<string> topics, CancellationToken cancellationToken)
-{
-    var config = new ConsumerConfig
-    {
-        BootstrapServers = brokerList,
-        GroupId = "csharp-consumer",
-        EnableAutoCommit = false,
-        StatisticsIntervalMs = 5000,
-        SessionTimeoutMs = 6000,
-        AutoOffsetReset = AutoOffsetReset.Earliest,
-        EnablePartitionEof = true
-    };
-
-    const int commitPeriod = 5;
-
-    // Note: If a key or value deserializer is not set (as is the case below), the 
-    // deserializer corresponding to the appropriate type from Confluent.Kafka.Deserializers
-    // will be used automatically (where available). The default deserializer for string
-    // is UTF8. The default deserializer for Ignore returns null for all input data
-    // (including non-null data).
-    using (var consumer = new ConsumerBuilder<int, string>(config)
-        // Note: All handlers are called on the main .Consume thread.
-        .SetErrorHandler((_, e) => Console.WriteLine($"Error: {e.Reason}"))
-        // .SetStatisticsHandler((_, json) => Console.WriteLine($"Statistics: {json}"))
-        .SetPartitionsAssignedHandler((c, partitions) =>
-        {
-            Console.WriteLine($"Assigned partitions: [{string.Join(", ", partitions)}]");
-            // possibly manually specify start offsets or override the partition assignment provided by
-            // the consumer group by returning a list of topic/partition/offsets to assign to, e.g.:
-            // 
-            // return partitions.Select(tp => new TopicPartitionOffset(tp, externalOffsets[tp]));
-        })
-        .SetPartitionsRevokedHandler((c, partitions) =>
-        {
-            Console.WriteLine($"Revoking assignment: [{string.Join(", ", partitions)}]");
-        })
-        .Build())
-    {
-        consumer.Subscribe(topics);
-
-        try
-        {
-            while (true)
-            {
-                try
-                {
-                    var consumeResult = consumer.Consume(cancellationToken);
-
-                    if (consumeResult.IsPartitionEOF)
-                    {
-                        Console.WriteLine(
-                            $"Reached end of topic {consumeResult.Topic}, partition {consumeResult.Partition}, offset {consumeResult.Offset}.");
-
-                        continue;
-                    }
-
-                    Console.WriteLine($"Received message at {consumeResult.TopicPartitionOffset}: {consumeResult.Message.Value}");
-
-                    if (consumeResult.Offset % commitPeriod == 0)
-                    {
-                        // The Commit method sends a "commit offsets" request to the Kafka
-                        // cluster and synchronously waits for the response. This is very
-                        // slow compared to the rate at which the consumer is capable of
-                        // consuming messages. A high performance application will typically
-                        // commit offsets relatively infrequently and be designed handle
-                        // duplicate messages in the event of failure.
-                        try
-                        {
-                            consumer.Commit(consumeResult);
-                        }
-                        catch (KafkaException e)
-                        {
-                            Console.WriteLine($"Commit error: {e.Error.Reason}");
-                        }
-                    }
-                }
-                catch (ConsumeException e)
-                {
-                    Console.WriteLine($"Consume error: {e.Error.Reason}");
-                }
-            }
-        }
-        catch (OperationCanceledException)
-        {
-            Console.WriteLine("Closing consumer.");
-            consumer.Close();
+            this.languageStore = languageStore;
+            this.validationErrorProducer = validationErrorProducer;
+            this.logger = logger;
         }
     }
-}
-```
+    ```
+     - Override `HandleMessage` with an `async` method to validate the message key corresponds to an entry in the language store, producing an error event if validation fails.
+    ```csharp
+    public override async Task<Message> HandleMessage(Message sourceMessage)
+    {
+        // Validate supported language
+        // For simplicity, message key corresponds to selected language
+        var message = (Message<int, string>)sourceMessage;
+        bool validationPassed;
+        if (languageStore.ContainsKey(message.Key))
+        {
+            validationPassed = true;
+        }
+        else
+        {
+            var errorMessage = $"No language corresponds to message key '{message.Key}'";
+            validationErrorProducer.ProduceEvent(
+                new Confluent.Kafka.Message<int, string>
+                {
+                    Key = message.Key,
+                    Value = errorMessage
+                });
+            logger.LogInformation($"Validation handler: {errorMessage}");
+            return null;
+        }
 
-3. Call the `Run_Consumer` method.
+        // Log result and call next handler
+        var sinkMessage = new Message<int, string>(message.Key, message.Value);
+        if (validationPassed)
+        {
+            logger.LogInformation($"Validation handler: Passed { sinkMessage.Key } { sinkMessage.Value }");
+        }
+        return await base.HandleMessage(sinkMessage);
+    }
+    ```
+   - Add an `EnrichmentHandler` class to the **Handlers** folder that extends `MessageHandler`.
+     - Add a **ctor** to inject `languageStore`, `logger`.
+    ```csharp
+    public class EnrichmentHandler : MessageHandler
+    {
+        private readonly IDictionary<int, string> languageStore;
+        private readonly ILogger logger;
 
-```csharp
-static void Main(string[] args)
-{
-    CancellationTokenSource cts = new CancellationTokenSource();
-    Console.CancelKeyPress += (_, e) => {
-        e.Cancel = true; // prevent the process from terminating.
-        cts.Cancel();
+        public EnrichmentHandler(IDictionary<int, string> languageStore, ILogger logger)
+        {
+            this.languageStore = languageStore;
+            this.logger = logger;
+        }
+    }
+    ```
+     - Override `HandleMessage` with an `async` method to enrich the message by replacing "Hello" with a translated greeting.
+    ```csharp
+    public override async Task<Message> HandleMessage(Message sourceMessage)
+    {
+        // Get greeting in supported language 
+        // For simplicity, message key corresponds to selected language
+        var message = (Message<int, string>)sourceMessage;
+        var value = message.Value;
+        if (languageStore.TryGetValue(message.Key, out string greeting))
+        {
+            value = message.Value.Replace("Hello", greeting);
+        }
+
+        // Call next handler
+        var sinkMessage = new Message<int, string>(message.Key, value);
+        logger.LogInformation($"Enrichment handler: {sinkMessage.Key} {sinkMessage.Value }");
+        return await base.HandleMessage(sinkMessage);
+    }
+    ```
+   - Add an `FilterHandler` class to the **Handlers** folder that extends `MessageHandler`.
+     - Add a **ctor** to inject `logger` and a `Func` that accepts a `Message` and returns `bool` so that the caller can specify a filtering strategy.
+    ```csharp
+    public class FilterHandler : MessageHandler
+    {
+        private readonly Func<Message<int, string>, bool> filter;
+        private readonly ILogger logger;
+
+        public FilterHandler(Func<Message<int, string>, bool> filter, ILogger logger)
+        {
+            this.filter = filter;
+            this.logger = logger;
+        }
+    }
+    ```
+     - Override `HandleMessage` with an `async` method to filter the message by supplied strategy.
+    ```csharp
+    public override async Task<Message> HandleMessage(Message sourceMessage)
+    {
+        // Filter message
+        var message = (Message<int, string>)sourceMessage;
+        if (!filter(message))
+        {
+            logger.LogInformation($"Filter handler: Excluded { message.Key } { message.Value }");
+            return null;
+        }
+
+        // Call next handler
+        var sinkMessage = new Message<int, string>(message.Key, message.Value);
+        logger.LogInformation($"Filter handler: Accepted { sinkMessage.Key } { sinkMessage.Value }");
+        return await base.HandleMessage(sinkMessage);
+    }
+    ```
+
+3. Register `IEventProcessor` with the dependency injection system in `Program.CreateHostBuilder`.
+   - Inside `Host.CreateDefaultBuilder.ConfigureServices` call `services.AddSingleton<IEventProcessor>` on line 54 in **Program.cs**, passing a lambda in which you resolve the necessary dependencies.
+    ```csharp
+    // Add event processor
+    services.AddSingleton<IEventProcessor>(sp =>
+    {
+
+    });
+    ```
+   - Inside the lamda statement, get `ILogger` from the DI system.
+    ```csharp
+    // Get logger
+    var logger = sp.GetRequiredService<ILogger>();
+    ```
+   - Use `KafkaUtils` to create a consumer to read the "raw-events" topic.
+    ```csharp
+    // Create raw-events consumer
+    var kafkaConsumer = KafkaUtils.CreateConsumer(consumerOptions.Brokers, 
+        consumerOptions.TopicsList, logger);
+    ```
+   - Use `KafkaUtils` to create a producer to write to the "validation-error-events" topic.
+    ```csharp
+    // Create validation-error-events producer
+    var kafkaErrorProducer = KafkaUtils.CreateProducer(producerOptions.Brokers, logger);
+    ```
+   - Use `KafkaUtils` to create a producer to write to the "processed-events" topic.
+    ```csharp
+    // Create processed-events producer
+    var kafkaFinalProducer = KafkaUtils.CreateProducer(producerOptions.Brokers, logger);
+    ```
+   - Create the handlers collection.
+    ```csharp
+    // Create handlers
+    var handlers = new List<MessageHandler>
+    {
+        new ValidationHandler(languageStore, new KafkaEventProducer<int, string>
+            (kafkaErrorProducer, producerOptions.ValidationTopic, logger), logger),
+        new EnrichmentHandler(languageStore, logger),
+        new FilterHandler(m => !m.Value.Contains("Hello"), logger) // Filter out English greetings
     };
+    ```
+   - Lastly, return a new `KafkaEventProcessor`, passing a new `KafkaEventConsumer`, new `KafkaEventProducer`, and the `handlers` array.
+    ```csharp
+    // Create event processor
+    return new KafkaEventProcessor<int, string, int, string>(
+        new KafkaEventConsumer<int, string>(kafkaConsumer, logger),
+        new KafkaEventProducer<int, string>(kafkaFinalProducer, producerOptions.FinalTopic, logger),
+        handlers.ToArray());
+    ```
 
-    Run_Consumer("localhost:9092", new List<string> { "raw-events" }, cts.Token);
-}
-```
+4. Update `KafkaWorker` class.
+   - Inject `IEventProcessor` into the **ctor**.
+   - In `ExecuteAsync` call `eventProcessor.Process` in the `while` loop.
+    ```csharp
+    public class KafkaWorker : BackgroundService
+    {
+        private readonly IEventProcessor eventProcessor;
+        private readonly ILogger logger;
+
+        public KafkaWorker(IEventProcessor eventProcessor, ILogger logger)
+        {
+            this.eventProcessor = eventProcessor;
+            this.logger = logger;
+        }
+
+        protected override async Task ExecuteAsync(CancellationToken cancellationToken)
+        {
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                logger.LogInformation("Worker processing event at: {time}", DateTimeOffset.Now);
+
+                // Process event
+                await eventProcessor.Process(cancellationToken);
+            }
+        }
+    }
+    ```
+
+## Usage
+
+1. Start the **Consumer** console app (Ctrl+F5).
+
+2. Set breakpoints in the **Worker** project to view the process flow.
+   - Set breakpoints in the `HandleMessage` method of each handler.
+   - Set a breakpoint in `eventProcessor.Process` in `KafkaWorker.ExecuteAsync`.
+   - Set a breakpoint in `Host.CreateDefaultBuilder.ConfigureServices` in `Program.CreateHostBuilder`.
+   - Press F5 to start the debugger.
+
+3. Start the **Producer** console app (Ctrl+F5).
+   - Enter the following values.
+    ```
+    1 Hello World
+    2 Hello World
+    3 Hello World
+    4 Hello World
+    5 Hello World
+    ```
+
+4. Note processing of the event stream for each message in the "raw-events" topic.
+   - Notice that messages 1, 2 and 3 are all translated.
+   - Notice that message 4 is filtered out because it is English.
+   - Notice that message 5 fails validation because no language corresponds to message key 5.
