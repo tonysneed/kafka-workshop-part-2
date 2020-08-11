@@ -1,4 +1,5 @@
 ﻿using Confluent.Kafka;
+using Microsoft.Extensions.Configuration;
 using System;
 using System.IO;
 using System.Threading;
@@ -8,15 +9,23 @@ namespace Producer
 {
     class Program
     {
-        static async Task Main(string[] args)
+        private static async Task Main(string[] args)
         {
+            // Get producer options
+            var config = LoadConfiguration();
+            var producerOptions = config
+                .GetSection(nameof(ProducerOptions))
+                .Get<ProducerOptions>();
+
+            // Prevent the process from terminating
             CancellationTokenSource cts = new CancellationTokenSource();
             Console.CancelKeyPress += (_, e) => {
-                e.Cancel = true; // prevent the process from terminating.
+                e.Cancel = true;
                 cts.Cancel();
             };
 
-            await Run_Producer("localhost:9092", "raw-events", cts.Token);
+            // Produce events
+            await Run_Producer(producerOptions.Brokers, producerOptions.RawTopic, cts.Token);
         }
 
         private static async Task Run_Producer(string brokerList, string topicName, CancellationToken cancellationToken)
@@ -84,6 +93,15 @@ namespace Producer
                 // in-flight and no delivery reports waiting to be acknowledged, so there is no
                 // need to call producer.Flush before disposing the producer.
             }
+        }
+
+        private static IConfiguration LoadConfiguration()
+        {
+            var builder = new ConfigurationBuilder()
+                .SetBasePath(Directory.GetCurrentDirectory())
+                .AddJsonFile("appsettings.json", optional: true, reloadOnChange: true)
+                .AddEnvironmentVariables();
+            return builder.Build();
         }
     }
 }

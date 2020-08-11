@@ -1,24 +1,43 @@
 ﻿using Confluent.Kafka;
+using Confluent.Kafka.Admin;
+using Microsoft.Extensions.Configuration;
 using System;
 using System.Collections.Generic;
+using System.IO;
+using System.Linq;
 using System.Threading;
+using System.Threading.Tasks;
 
 namespace Consumer
 {
     class Program
     {
-        static void Main(string[] args)
+        private static async Task Main(string[] args)
         {
+            // Get consumer options
+            var config = LoadConfiguration();
+            var consumerOptions = config
+                .GetSection(nameof(ConsumerOptions))
+                .Get<ConsumerOptions>();
+
+            Console.WriteLine($"Started consumer, Ctrl-C to stop consuming.");
+            Console.WriteLine($"Consumer Brokers: {consumerOptions.Brokers}");
+
+            // Prevent the process from terminating
             CancellationTokenSource cts = new CancellationTokenSource();
             Console.CancelKeyPress += (_, e) => {
                 e.Cancel = true; // prevent the process from terminating.
                 cts.Cancel();
             };
 
-            Run_Consumer("localhost:9092", new List<string> { "raw-events" }, cts.Token);
+            // Create topics
+            await CreateTopicAsync(consumerOptions.Brokers, consumerOptions.TopicsList);
+
+            // Consume events
+            Run_Consumer(consumerOptions.Brokers, consumerOptions.TopicsList, cts.Token);
         }
 
-        public static void Run_Consumer(string brokerList, List<string> topics, CancellationToken cancellationToken)
+        private static void Run_Consumer(string brokerList, List<string> topics, CancellationToken cancellationToken)
         {
             var config = new ConsumerConfig
             {
@@ -104,6 +123,39 @@ namespace Consumer
                 {
                     Console.WriteLine("Closing consumer.");
                     consumer.Close();
+                }
+            }
+        }
+
+        private static IConfiguration LoadConfiguration()
+        {
+            var builder = new ConfigurationBuilder()
+                .SetBasePath(Directory.GetCurrentDirectory())
+                .AddJsonFile("appsettings.json", optional: true, reloadOnChange: true)
+                .AddEnvironmentVariables();
+            return builder.Build();
+        }
+
+        private static async Task CreateTopicAsync(string brokerList, List<string> topics)
+        {
+            using (var adminClient = new AdminClientBuilder(new AdminClientConfig { BootstrapServers = brokerList }).Build())
+            {
+                try
+                {
+                    var meta = adminClient.GetMetadata(TimeSpan.FromSeconds(20));
+                    foreach (var topic in topics)
+                    {
+                        if (!meta.Topics.Exists(t => t.Topic == topic))
+                        {
+                            var topicSpecs = topics.Select(topicName =>
+                                new TopicSpecification { Name = topicName, ReplicationFactor = 1, NumPartitions = 1 });
+                            await adminClient.CreateTopicsAsync(topicSpecs);
+                        }
+                    }
+                }
+                catch (CreateTopicsException e)
+                {
+                    Console.WriteLine($"An error occured creating topic {e.Results[0].Topic}: {e.Results[0].Error.Reason}");
                 }
             }
         }
